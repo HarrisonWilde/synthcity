@@ -1,9 +1,11 @@
 # stdlib
+import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
 # third party
 import numpy as np
 import torch
+from opacus import PrivacyEngine
 from pydantic import validate_arguments
 from torch import Tensor, nn
 from torch.optim import Adam
@@ -185,6 +187,17 @@ class VAE(nn.Module):
             Minimum number of iterations to go through before starting early stopping
         patience: int
             Max number of iterations without any improvement before early stopping is trigged.
+        # privacy settings
+        dp_enabled: bool
+            Train the discriminator with Differential Privacy guarantees
+        dp_delta: Optional[float]
+            Optional DP delta: the probability of information accidentally being leaked. Usually 1 / len(dataset)
+        dp_epsilon: float = 3
+            DP epsilon: privacy budget, which is a measure of the amount of privacy that is preserved by a given algorithm. Epsilon is a number that represents the maximum amount of information that an adversary can learn about an individual from the output of a differentially private algorithm. The smaller the value of epsilon, the more private the algorithm is. For example, an algorithm with an epsilon of 0.1 preserves more privacy than an algorithm with an epsilon of 1.0.
+        dp_max_grad_norm: float
+            max grad norm used for gradient clipping
+        dp_secure_mode: bool = False,
+            if True uses noise generation approach robust to floating point arithmetic attacks.
     """
 
     @validate_arguments(config=dict(arbitrary_types_allowed=True))
@@ -224,6 +237,12 @@ class VAE(nn.Module):
         n_iter_min: int = 100,
         n_iter_print: int = 10,
         patience: int = 20,
+        # privacy settings
+        dp_enabled: bool = True,
+        dp_delta: Optional[float] = None,
+        dp_epsilon: float = 10.0,
+        dp_max_grad_norm: float = 2.0,
+        dp_secure_mode: bool = False,
     ) -> None:
         super(VAE, self).__init__()
 
@@ -275,6 +294,13 @@ class VAE(nn.Module):
         if decoder_nonlin_out is None:
             decoder_nonlin_out = [("none", n_features)]
         self.decoder_nonlin_out = decoder_nonlin_out
+
+        # privacy
+        self.dp_enabled = dp_enabled
+        self.dp_delta = dp_delta
+        self.dp_epsilon = dp_epsilon
+        self.dp_max_grad_norm = dp_max_grad_norm
+        self.dp_secure_mode = dp_secure_mode
 
     def fit(
         self,
@@ -384,11 +410,39 @@ class VAE(nn.Module):
         X, X_val, cond, cond_val = self._train_test_split(X, cond)
         loader = self._dataloader(X, cond)
 
-        optimizer = Adam(
-            self.parameters(),
+        warnings.resetwarnings()
+        warnings.simplefilter('always')
+
+        self.decoder.optimizer = Adam(
+            self.decoder.parameters(),
             weight_decay=self.weight_decay,
             lr=self.lr,
         )
+        self.encoder.optimizer = Adam(
+            self.encoder.parameters(),
+            weight_decay=self.weight_decay,
+            lr=self.lr,
+        )
+
+        # Privacy
+        if self.dp_enabled:
+            if self.dp_delta is None:
+                self.dp_delta = 1 / len(X)
+            privacy_engine = PrivacyEngine(secure_mode=self.dp_secure_mode)
+            (
+                self.decoder,
+                self.decoder.optimizer,
+                loader,
+            ) = privacy_engine.make_private_with_epsilon(
+                module=self.decoder,
+                optimizer=self.decoder.optimizer,
+                data_loader=loader,
+                epochs=self.n_iter,
+                target_epsilon=self.dp_epsilon,
+                target_delta=self.dp_delta,
+                max_grad_norm=self.dp_max_grad_norm,
+                poisson_sampling=False,
+            )
 
         best_loss = np.inf
         best_state_dict = None
@@ -414,16 +468,22 @@ class VAE(nn.Module):
                     logvar,
                     cond_mb,
                 )
-                optimizer.zero_grad()
+                self.encoder.optimizer.zero_grad()
+                self.decoder.optimizer.zero_grad()
                 if self.clipping_value > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.parameters(), self.clipping_value
                     )
                 loss.backward()
-                optimizer.step()
+                self.encoder.optimizer.step()
+                self.decoder.optimizer.step()
 
             if epoch % self.n_iter_print == 0:
                 self.eval()
+                if self.dp_enabled:
+                    log.debug(
+                        f"[{epoch}/{self.n_iter}] Privacy budget: epsilon = {privacy_engine.get_epsilon(self.dp_delta)} delta = {self.dp_delta}"
+                    )
                 mu, logvar = self.encoder(X_val, cond_val)
                 embedding = self._reparameterize(mu, logvar)
                 reconstructed = self.decoder(embedding, cond_val)

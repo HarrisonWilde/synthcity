@@ -1,4 +1,5 @@
 # stdlib
+import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
 # third party
@@ -481,6 +482,9 @@ class GAN(nn.Module):
 
         G_losses = []
         D_losses = []
+        warnings.resetwarnings()
+        warnings.simplefilter('always')
+
 
         for i, data in enumerate(loader):
             cond: Optional[torch.Tensor] = None

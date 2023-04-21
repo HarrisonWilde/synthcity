@@ -8,12 +8,13 @@ from loguru import logger
 
 LOG_FORMAT = "[{time}][{process.id}][{level}] {message}"
 
-logger.remove()
+# logger.remove()
 DEFAULT_SINK = "synthcity_{time}.log"
 
 
 def remove() -> None:
-    logger.remove()
+    # logger.remove()
+    pass
 
 
 def add(
